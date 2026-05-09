@@ -2,6 +2,7 @@
 #include "codecs/no_audio_codec.h"
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
+#include "display/emote_display.h"
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
@@ -10,12 +11,27 @@
 #include <esp_log.h>
 #include "i2c_device.h"
 #include <driver/i2c_master.h>
+#include <cstdlib>
+#include "i2c_bus.h"
 #include <driver/ledc.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st77916.h>
+#include "esp_lcd_touch_cst816s.h"
+#include "touch.h"
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
+
+
+extern "C" {
+#include "touch_button_sensor.h"
+#include "touch_slider_sensor.h"
+}
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 
 #include "power_manager.h"
 #include "power_save_timer.h"
@@ -215,14 +231,176 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
     {0x29, (uint8_t []){0x00}, 1, 0},  
 };
 
+class Cst816s : public I2cDevice {
+public:
+    struct TouchPoint_t {
+        int num = 0;
+        int x = -1;
+        int y = -1;
+    };
+
+    enum TouchEvent {
+        TOUCH_NONE,
+        TOUCH_PRESS,
+        TOUCH_RELEASE,
+        TOUCH_HOLD
+    };
+
+    Cst816s(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
+    {
+        read_buffer_ = new uint8_t[6];
+        was_touched_ = false;
+        press_count_ = 0;
+
+        // Create touch interrupt semaphore
+        touch_isr_mux_ = xSemaphoreCreateBinary();
+        if (touch_isr_mux_ == NULL) {
+            ESP_LOGE(TAG, "Failed to create touch semaphore");
+        }
+    }
+
+    ~Cst816s()
+    {
+        delete[] read_buffer_;
+
+        // Delete semaphore if it exists
+        if (touch_isr_mux_ != NULL) {
+            vSemaphoreDelete(touch_isr_mux_);
+            touch_isr_mux_ = NULL;
+        }
+    }
+
+    void UpdateTouchPoint()
+    {
+        ReadRegs(0x02, read_buffer_, 6);
+        tp_.num = read_buffer_[0] & 0x0F;
+        tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
+        tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
+    }
+
+    const TouchPoint_t &GetTouchPoint()
+    {
+        return tp_;
+    }
+
+    TouchEvent CheckTouchEvent()
+    {
+        bool is_touched = (tp_.num > 0);
+        TouchEvent event = TOUCH_NONE;
+
+        if (is_touched && !was_touched_) {
+            // Press event (transition from not touched to touched)
+            press_count_++;
+            event = TOUCH_PRESS;
+            ESP_LOGI(TAG, "TOUCH PRESS - count: %d, x: %d, y: %d", press_count_, tp_.x, tp_.y);
+        } else if (!is_touched && was_touched_) {
+            // Release event (transition from touched to not touched)
+            event = TOUCH_RELEASE;
+            ESP_LOGI(TAG, "TOUCH RELEASE - total presses: %d", press_count_);
+        } else if (is_touched && was_touched_) {
+            // Continuous touch (hold)
+            event = TOUCH_HOLD;
+            ESP_LOGD(TAG, "TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
+        }
+
+        // Update previous state
+        was_touched_ = is_touched;
+        return event;
+    }
+
+    int GetPressCount() const
+    {
+        return press_count_;
+    }
+
+    void ResetPressCount()
+    {
+        press_count_ = 0;
+    }
+
+    // Semaphore management methods
+    SemaphoreHandle_t GetTouchSemaphore()
+    {
+        return touch_isr_mux_;
+    }
+
+    bool WaitForTouchEvent(TickType_t timeout = portMAX_DELAY)
+    {
+        if (touch_isr_mux_ != NULL) {
+            return xSemaphoreTake(touch_isr_mux_, timeout) == pdTRUE;
+        }
+        return false;
+    }
+
+    void NotifyTouchEvent()
+    {
+        if (touch_isr_mux_ != NULL) {
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(touch_isr_mux_, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+    }
+
+private:
+    uint8_t* read_buffer_ = nullptr;
+    TouchPoint_t tp_;
+
+    // Touch state tracking
+    bool was_touched_;
+    int press_count_;
+
+    // Touch interrupt semaphore
+    SemaphoreHandle_t touch_isr_mux_;
+};
+
 class CustomBoard : public WifiBoard {
 private:
     Button boot_button_;
     i2c_master_bus_handle_t i2c_bus_;
+    i2c_bus_handle_t shared_i2c_bus_handle_ = nullptr;
     esp_io_expander_handle_t io_expander = NULL;
     LcdDisplay* display_;
+    Cst816s* cst816s_;
+    esp_lcd_touch_handle_t tp;   // LCD touch handle
+    TaskHandle_t touch_task_handle_ = nullptr;
+    TaskHandle_t touch_slider_task_handle_ = nullptr;
+    esp_timer_handle_t emotion_reset_timer_ = nullptr;
+    touch_slider_handle_t touch_slider_handle_ = nullptr;
+    touch_button_handle_t touch_button_handle_ = nullptr;
     PowerManager* power_manager_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
+
+    static void emotion_reset_timer_callback(void* arg)
+    {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self && self->display_ != nullptr) {
+            self->display_->SetEmotion("neutral");
+        }
+    }
+
+    void ShowTemporaryEmotion(const char* emotion, uint32_t duration_ms)
+    {
+        if (display_ == nullptr || emotion == nullptr) {
+            return;
+        }
+        display_->SetEmotion(emotion);
+        if (emotion_reset_timer_ != nullptr) {
+            esp_timer_stop(emotion_reset_timer_);
+            esp_timer_start_once(emotion_reset_timer_, static_cast<uint64_t>(duration_ms) * 1000ULL);
+        }
+    }
+
+    void ShowHappyTouchFeedback()
+    {
+        static int64_t s_last_us = 0;
+        constexpr int64_t kCooldownUs = 1200000;
+        const int64_t now = esp_timer_get_time();
+        if ((now - s_last_us) < kCooldownUs) {
+            return;
+        }
+        s_last_us = now;
+        ShowTemporaryEmotion("happy", 2000);
+    }
 
     void InitializePowerManager() {
         power_manager_ = new PowerManager(BATTERY_CHARGING_PIN, BATTERY_ADC_PIN, BATTERY_EN_PIN);
@@ -244,6 +422,99 @@ private:
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->SetEnabled(true);
+    }
+
+    static void touch_isr_callback(void* arg)
+    {
+        Cst816s* touchpad = static_cast<Cst816s*>(arg);
+        if (touchpad != nullptr) {
+            touchpad->NotifyTouchEvent();
+        }
+    }
+
+    static void touch_event_task(void* arg)
+    {
+        Cst816s* touchpad = static_cast<Cst816s*>(arg);
+        if (touchpad == nullptr) {
+            ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
+            vTaskDelete(NULL);
+            return;
+        }
+
+        while (true) {
+            if (touchpad->WaitForTouchEvent()) {
+                auto &app = Application::GetInstance();
+                auto &board = (EspVocat &)Board::GetInstance();
+
+                ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
+                touchpad->UpdateTouchPoint();
+                auto touch_event = touchpad->CheckTouchEvent();
+
+                if (touch_event == Cst816s::TOUCH_RELEASE) {
+                    if (app.GetDeviceState() == kDeviceStateStarting) {
+                        board.EnterWifiConfigMode();
+                    } else {
+                        app.ToggleChatState();
+                    }
+                }
+            }
+        }
+    }
+
+    void InitializeCst816sTouchPad()
+    {
+        cst816s_ = new Cst816s(i2c_bus_, 0x15);
+
+        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5, &touch_task_handle_, 1);
+
+        const gpio_config_t int_gpio_config = {
+            .pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
+            .mode = GPIO_MODE_INPUT,
+            // .intr_type = GPIO_INTR_NEGEDGE
+            .intr_type = GPIO_INTR_ANYEDGE
+        };
+        gpio_config(&int_gpio_config);
+        gpio_install_isr_service(0);
+        gpio_intr_enable(TP_PIN_NUM_INT);
+        gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
+    }
+
+    static void touch_slider_event_callback(touch_slider_handle_t handle, touch_slider_event_t event, int32_t data, void* cb_arg)
+    {
+        (void)handle;
+        auto* self = static_cast<EspVocat*>(cb_arg);
+        if (self == nullptr || self->display_ == nullptr) {
+            return;
+        }
+        if (event != TOUCH_SLIDER_EVENT_POSITION) {
+            ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
+        }
+
+        bool gesture = false;
+        if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
+            gesture = true;
+        } else if (event == TOUCH_SLIDER_EVENT_RELEASE) {
+            gesture = true;
+        }
+
+        if (!gesture) {
+            return;
+        }
+
+        self->ShowHappyTouchFeedback();
+    }
+
+    static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
+    {
+        (void)handle;
+        auto* self = static_cast<EspVocat*>(cb_arg);
+        if (self == nullptr || self->display_ == nullptr) {
+            return;
+        }
+        if (state == TOUCH_STATE_ACTIVE) {
+            ESP_LOGI(TAG, "Touch button ACTIVE ch=%" PRIu32, channel);
+            self->ShowHappyTouchFeedback();
+        }
     }
 
     void InitializeI2c() {
@@ -395,6 +666,55 @@ private:
     }
 
 public:
+
+    ~CustomBoard() {
+        // Stop tasks
+        if (charge_task_handle_ != nullptr) {
+            vTaskDelete(charge_task_handle_);
+        }
+        if (touch_task_handle_ != nullptr) {
+            vTaskDelete(touch_task_handle_);
+        }
+        if (imu_task_handle_ != nullptr) {
+            vTaskDelete(imu_task_handle_);
+        }
+        if (touch_slider_task_handle_ != nullptr) {
+            vTaskDelete(touch_slider_task_handle_);
+            touch_slider_task_handle_ = nullptr;
+        }
+        if (touch_slider_handle_ != nullptr) {
+            touch_slider_sensor_delete(touch_slider_handle_);
+            touch_slider_handle_ = nullptr;
+        }
+        if (touch_button_handle_ != nullptr) {
+            touch_button_sensor_delete(touch_button_handle_);
+            touch_button_handle_ = nullptr;
+        }
+
+        // Delete objects
+        delete charge_;
+        delete cst816s_;
+        delete display_;
+        // Note: backlight_ (PwmBacklight) and camera_ (EspVideo) are not deleted here
+        // because their base classes (Backlight, Camera) don't have virtual destructors.
+        // Since EspVocat is a singleton that lives for the device lifetime, this is acceptable.
+
+        // Remove GPIO ISR handler
+        gpio_isr_handler_remove(TP_PIN_NUM_INT);
+        if (emotion_reset_timer_ != nullptr) {
+            esp_timer_stop(emotion_reset_timer_);
+            esp_timer_delete(emotion_reset_timer_);
+            emotion_reset_timer_ = nullptr;
+        }
+
+        // Disable temperature sensor
+        if (temp_sensor != NULL) {
+            temperature_sensor_disable(temp_sensor);
+            temperature_sensor_uninstall(temp_sensor);
+            temp_sensor = NULL;
+        }
+    }
+
     CustomBoard() :
         boot_button_(BOOT_BUTTON_GPIO) {
         InitializePowerManager();
@@ -428,6 +748,12 @@ public:
         return display_;
     }
     
+    Cst816s* GetTouchpad()
+    {
+        return cst816s_;
+    }
+
+
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
