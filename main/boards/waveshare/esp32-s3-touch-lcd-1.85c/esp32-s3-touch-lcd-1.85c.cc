@@ -23,15 +23,9 @@
 #include "esp_io_expander_tca9554.h"
 
 
-extern "C" {
-#include "touch_button_sensor.h"
-#include "touch_slider_sensor.h"
-}
-
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
-
 
 #include "power_manager.h"
 #include "power_save_timer.h"
@@ -357,22 +351,18 @@ class CustomBoard : public WifiBoard {
 private:
     Button boot_button_;
     i2c_master_bus_handle_t i2c_bus_;
-    i2c_bus_handle_t shared_i2c_bus_handle_ = nullptr;
     esp_io_expander_handle_t io_expander = NULL;
-    LcdDisplay* display_;
+    Display* display_ = nullptr;
     Cst816s* cst816s_;
     esp_lcd_touch_handle_t tp;   // LCD touch handle
     TaskHandle_t touch_task_handle_ = nullptr;
-    TaskHandle_t touch_slider_task_handle_ = nullptr;
     esp_timer_handle_t emotion_reset_timer_ = nullptr;
-    touch_slider_handle_t touch_slider_handle_ = nullptr;
-    touch_button_handle_t touch_button_handle_ = nullptr;
     PowerManager* power_manager_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
 
     static void emotion_reset_timer_callback(void* arg)
     {
-        auto* self = static_cast<EspVocat*>(arg);
+        auto* self = static_cast<CustomBoard*>(arg);
         if (self && self->display_ != nullptr) {
             self->display_->SetEmotion("neutral");
         }
@@ -424,99 +414,6 @@ private:
         power_save_timer_->SetEnabled(true);
     }
 
-    static void touch_isr_callback(void* arg)
-    {
-        Cst816s* touchpad = static_cast<Cst816s*>(arg);
-        if (touchpad != nullptr) {
-            touchpad->NotifyTouchEvent();
-        }
-    }
-
-    static void touch_event_task(void* arg)
-    {
-        Cst816s* touchpad = static_cast<Cst816s*>(arg);
-        if (touchpad == nullptr) {
-            ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
-            vTaskDelete(NULL);
-            return;
-        }
-
-        while (true) {
-            if (touchpad->WaitForTouchEvent()) {
-                auto &app = Application::GetInstance();
-                auto &board = (EspVocat &)Board::GetInstance();
-
-                ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
-                touchpad->UpdateTouchPoint();
-                auto touch_event = touchpad->CheckTouchEvent();
-
-                if (touch_event == Cst816s::TOUCH_RELEASE) {
-                    if (app.GetDeviceState() == kDeviceStateStarting) {
-                        board.EnterWifiConfigMode();
-                    } else {
-                        app.ToggleChatState();
-                    }
-                }
-            }
-        }
-    }
-
-    void InitializeCst816sTouchPad()
-    {
-        cst816s_ = new Cst816s(i2c_bus_, 0x15);
-
-        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5, &touch_task_handle_, 1);
-
-        const gpio_config_t int_gpio_config = {
-            .pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
-            .mode = GPIO_MODE_INPUT,
-            // .intr_type = GPIO_INTR_NEGEDGE
-            .intr_type = GPIO_INTR_ANYEDGE
-        };
-        gpio_config(&int_gpio_config);
-        gpio_install_isr_service(0);
-        gpio_intr_enable(TP_PIN_NUM_INT);
-        gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
-    }
-
-    static void touch_slider_event_callback(touch_slider_handle_t handle, touch_slider_event_t event, int32_t data, void* cb_arg)
-    {
-        (void)handle;
-        auto* self = static_cast<EspVocat*>(cb_arg);
-        if (self == nullptr || self->display_ == nullptr) {
-            return;
-        }
-        if (event != TOUCH_SLIDER_EVENT_POSITION) {
-            ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
-        }
-
-        bool gesture = false;
-        if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
-            gesture = true;
-        } else if (event == TOUCH_SLIDER_EVENT_RELEASE) {
-            gesture = true;
-        }
-
-        if (!gesture) {
-            return;
-        }
-
-        self->ShowHappyTouchFeedback();
-    }
-
-    static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
-    {
-        (void)handle;
-        auto* self = static_cast<EspVocat*>(cb_arg);
-        if (self == nullptr || self->display_ == nullptr) {
-            return;
-        }
-        if (state == TOUCH_STATE_ACTIVE) {
-            ESP_LOGI(TAG, "Touch button ACTIVE ch=%" PRIu32, channel);
-            self->ShowHappyTouchFeedback();
-        }
-    }
-
     void InitializeI2c() {
         // Initialize I2C peripheral
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -552,6 +449,61 @@ private:
         vTaskDelay(pdMS_TO_TICKS(300));
         ret = esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1, 1);                                // 复位 LCD 与 TouchPad
         ESP_ERROR_CHECK(ret);
+    }
+
+    static void touch_isr_callback(void* arg)
+    {
+        Cst816s* touchpad = static_cast<Cst816s*>(arg);
+        if (touchpad != nullptr) {
+            touchpad->NotifyTouchEvent();
+        }
+    }
+
+    static void touch_event_task(void* arg)
+    {
+        Cst816s* touchpad = static_cast<Cst816s*>(arg);
+        if (touchpad == nullptr) {
+            ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
+            vTaskDelete(NULL);
+            return;
+        }
+
+        while (true) {
+            if (touchpad->WaitForTouchEvent()) {
+                auto &app = Application::GetInstance();
+                auto &board = (CustomBoard &)Board::GetInstance();
+
+                ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
+                touchpad->UpdateTouchPoint();
+                auto touch_event = touchpad->CheckTouchEvent();
+
+                if (touch_event == Cst816s::TOUCH_RELEASE) {
+                    if (app.GetDeviceState() == kDeviceStateStarting) {
+                        board.EnterWifiConfigMode();
+                    } else {
+                        app.ToggleChatState();
+                    }
+                }
+            }
+        }
+    }
+
+    void InitializeCst816sTouchPad()
+    {
+        cst816s_ = new Cst816s(i2c_bus_, 0x15);
+
+        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5, &touch_task_handle_, 1);
+
+        const gpio_config_t int_gpio_config = {
+            .pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
+            .mode = GPIO_MODE_INPUT,
+            // .intr_type = GPIO_INTR_NEGEDGE
+            .intr_type = GPIO_INTR_ANYEDGE
+        };
+        gpio_config(&int_gpio_config);
+        gpio_install_isr_service(0);
+        gpio_intr_enable(TP_PIN_NUM_INT);
+        gpio_isr_handler_add(TP_PIN_NUM_INT, CustomBoard::touch_isr_callback, cst816s_);
     }
 
     void InitializeSpi() {
@@ -650,8 +602,12 @@ private:
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#else
         display_ = new SpiLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+#endif
     }
 
     void InitializeButtons() {
@@ -669,30 +625,12 @@ public:
 
     ~CustomBoard() {
         // Stop tasks
-        if (charge_task_handle_ != nullptr) {
-            vTaskDelete(charge_task_handle_);
-        }
+
         if (touch_task_handle_ != nullptr) {
             vTaskDelete(touch_task_handle_);
         }
-        if (imu_task_handle_ != nullptr) {
-            vTaskDelete(imu_task_handle_);
-        }
-        if (touch_slider_task_handle_ != nullptr) {
-            vTaskDelete(touch_slider_task_handle_);
-            touch_slider_task_handle_ = nullptr;
-        }
-        if (touch_slider_handle_ != nullptr) {
-            touch_slider_sensor_delete(touch_slider_handle_);
-            touch_slider_handle_ = nullptr;
-        }
-        if (touch_button_handle_ != nullptr) {
-            touch_button_sensor_delete(touch_button_handle_);
-            touch_button_handle_ = nullptr;
-        }
 
         // Delete objects
-        delete charge_;
         delete cst816s_;
         delete display_;
         // Note: backlight_ (PwmBacklight) and camera_ (EspVideo) are not deleted here
@@ -706,23 +644,27 @@ public:
             esp_timer_delete(emotion_reset_timer_);
             emotion_reset_timer_ = nullptr;
         }
-
-        // Disable temperature sensor
-        if (temp_sensor != NULL) {
-            temperature_sensor_disable(temp_sensor);
-            temperature_sensor_uninstall(temp_sensor);
-            temp_sensor = NULL;
-        }
     }
 
     CustomBoard() :
         boot_button_(BOOT_BUTTON_GPIO) {
+
+        const esp_timer_create_args_t emotion_timer_args = {
+            .callback = &CustomBoard::emotion_reset_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "emotion_rst",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&emotion_timer_args, &emotion_reset_timer_));
+
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeI2c();
         InitializeTca9554();
         InitializeSpi();
         Initializest77916Display();
+        InitializeCst816sTouchPad();
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
     }
