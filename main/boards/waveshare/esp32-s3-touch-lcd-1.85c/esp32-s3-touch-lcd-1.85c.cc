@@ -21,10 +21,17 @@
 #include "touch.h"
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
+#include <cJSON.h>
+#include <vector>
+#include <cstring>
 
 #include "esp_private/sdmmc_common.h"
 #include <esp_vfs_fat.h>
 #include <driver/sdspi_host.h>
+
+#include "audio_player.h"
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -230,6 +237,7 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
 
 class CustomLcdDisplay : public SpiLcdDisplay
 {
+    lv_obj_t* music_label_ = nullptr;
 public:
     CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
                      esp_lcd_panel_handle_t panel_handle,
@@ -303,10 +311,30 @@ public:
         // 状态栏容器适配
         lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 0.12, 0);  // 左侧填充12%
         lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 0.12, 0); // 右侧填充12%
+
+        // 创建播放状态图标
+        music_label_ = lv_label_create(top_bar_);
+        lv_label_set_text(music_label_, "");
+        lv_obj_add_flag(music_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align(music_label_, LV_ALIGN_LEFT_MID, 0, 0);
+
         // 表情容器上移适配
         lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -30);          // 向上偏移30
         // 消息栏适配
         lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, -20);     // 向上偏移20
+    }
+
+    void UpdateMusicStatus(bool playing, bool paused) {
+        DisplayLockGuard lock(this);
+        if (music_label_ == nullptr) return;
+        
+        if (!playing) {
+            lv_obj_add_flag(music_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(music_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(music_label_, paused ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+            lv_obj_set_style_text_color(music_label_, paused ? lv_palette_main(LV_PALETTE_ORANGE) : lv_palette_main(LV_PALETTE_GREEN), 0);
+        }
     }
 };
 
@@ -433,6 +461,9 @@ private:
     SemaphoreHandle_t touch_isr_mux_;
 };
 
+// 用于保存原有的 SD SPI 事务处理函数
+static esp_err_t (*orig_sd_do_transaction)(int slot, sdmmc_command_t *cmdinfo) = nullptr;
+
 class CustomBoard : public WifiBoard {
 private:
     Button boot_button_;
@@ -446,6 +477,44 @@ private:
     esp_timer_handle_t emotion_reset_timer_ = nullptr;
     PowerManager* power_manager_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
+
+    // 静态成员函数，用于控制 SD 卡片选
+    static esp_err_t sd_cs_set_level(int level) {
+        CustomBoard* board = static_cast<CustomBoard*>(&Board::GetInstance());
+        if (board && board->io_expander) {
+            return esp_io_expander_set_level(board->io_expander, IO_EXPANDER_PIN_NUM_2, level);
+        }
+        return ESP_FAIL;
+    }
+
+    // 包装后的事务处理函数，在操作前后切换 CS
+    static esp_err_t sd_do_transaction(int slot, sdmmc_command_t *cmdinfo) {
+        sd_cs_set_level(0); // 选中 SD 卡
+        esp_err_t ret = orig_sd_do_transaction(slot, cmdinfo);
+        sd_cs_set_level(1); // 释放 SD 卡
+        return ret;
+    }
+
+    // Audio player callbacks
+    static esp_err_t audio_mute_callback(AUDIO_PLAYER_MUTE_SETTING setting) {
+        return ESP_OK;
+    }
+
+    static esp_err_t audio_reconfig_callback(uint32_t rate, uint32_t bits_cfg, i2s_slot_mode_t slot_mode) {
+        ESP_LOGI(TAG, "Audio reconfig: rate=%lu, bits=%lu, slot_mode=%d", rate, bits_cfg, (int)slot_mode);
+        return ESP_OK;
+    }
+
+    static esp_err_t audio_write_callback(void *audio_buffer, size_t size, size_t *bytes_written, uint32_t timeout_ms) {
+        auto codec = Board::GetInstance().GetAudioCodec();
+        if (codec) {
+            std::vector<int16_t> data((int16_t*)audio_buffer, (int16_t*)audio_buffer + size / 2);
+            codec->OutputData(data);
+            *bytes_written = size;
+            return ESP_OK;
+        }
+        return ESP_FAIL;
+    }
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -540,17 +609,17 @@ private:
         if(ret != ESP_OK)
             ESP_LOGE(TAG, "TCA9554 create returned error");        
 
-        // uint32_t input_level_mask = 0;
-        // ret = esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1, IO_EXPANDER_INPUT);               // 设置引脚 EXIO0 和 EXIO1 模式为输入 
-        // ret = esp_io_expander_get_level(io_expander, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1, &input_level_mask);             // 获取引脚 EXIO0 和 EXIO1 的电平状态,存放在 input_level_mask 中
-
-        // ret = esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_2 | IO_EXPANDER_PIN_NUM_3, IO_EXPANDER_OUTPUT);              // 设置引脚 EXIO2 和 EXIO3 模式为输出
-        // ret = esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_2 | IO_EXPANDER_PIN_NUM_3, 1);                             // 将引脚电平设置为 1
-        // ret = esp_io_expander_print_state(io_expander);                                                                             // 打印引脚状态
-
-        ret = esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1, IO_EXPANDER_OUTPUT);                 // 设置引脚 EXIO0 和 EXIO1 模式为输出
+        // 设置 EXIO0, EXIO1, EXIO2 为输出模式
+        ret = esp_io_expander_set_dir(io_expander, 
+                                      IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2, 
+                                      IO_EXPANDER_OUTPUT);
         ESP_ERROR_CHECK(ret);
-        ret = esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1, 1);                                // 复位 LCD 与 TouchPad
+
+        // 初始时将 EXIO0, EXIO1, EXIO2 都设置为高电平。
+        // EXIO0/1 用于 LCD/TouchPad 复位，EXIO2 用于 SD CS (非激活状态)
+        ret = esp_io_expander_set_level(io_expander, 
+                                      IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1 | IO_EXPANDER_PIN_NUM_2, 
+                                      1);
         ESP_ERROR_CHECK(ret);
         vTaskDelay(pdMS_TO_TICKS(300));
         ret = esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_0 | IO_EXPANDER_PIN_NUM_1, 0);                                // 复位 LCD 与 TouchPad
@@ -590,6 +659,7 @@ private:
                     if (app.GetDeviceState() == kDeviceStateStarting) {
                         board.EnterWifiConfigMode();
                     } else {
+                        audio_player_pause(); // 触摸屏幕开始/切换对话时暂停音乐
                         app.ToggleChatState();
                     }
                 }
@@ -751,8 +821,13 @@ private:
         };
         
         sdmmc_card_t* card = NULL;
-        
+
+        // 分配自定义的 CS 控制函数
         sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+        // 挂钩 do_transaction 以便在每次操作时自动切换 CS 引脚
+        orig_sd_do_transaction = host.do_transaction;
+        host.do_transaction = sd_do_transaction;
+
         err = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &host, &slot_cnf, &mount_cnf, &card);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "SD卡挂载失败: %s", esp_err_to_name(err));
@@ -773,18 +848,132 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
+            audio_player_pause(); // 按键开始/切换对话时暂停音乐
             app.ToggleChatState();
         });
+    }
+
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+        
+        mcp_server.AddTool("self.music.list_songs",
+            "列出SD卡中所有的MP3歌曲文件。",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return ListSongs();
+            });
+
+        mcp_server.AddTool("self.music.play_song",
+            "从SD卡播放指定的MP3歌曲。请提供歌曲名称。",
+            PropertyList({
+                Property("name", kPropertyTypeString, "要播放的歌曲名称")
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto name = properties["name"].value<std::string>();
+                return PlayMp3(name);
+            });
+
+        mcp_server.AddTool("self.music.resume_song",
+            "恢复已暂停的音乐播放。",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return ResumeMp3();
+            });
+
+        mcp_server.AddTool("self.music.stop_song",
+            "停止当前的音乐播放。",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return StopMp3();
+            });
+    }
+
+    ReturnValue ListSongs() {
+        if (!is_sdcard_found) {
+            return "SD卡未挂载。";
+        }
+
+        DIR* dir = opendir(SD_MOUNT_POINT);
+        if (!dir) {
+            return "无法打开SD卡目录。";
+        }
+
+        cJSON* array = cJSON_CreateArray();
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_REG && strstr(entry->d_name, ".mp3")) {
+                cJSON_AddItemToArray(array, cJSON_CreateString(entry->d_name));
+            }
+        }
+        closedir(dir);
+
+        char* json_str = cJSON_PrintUnformatted(array);
+        std::string result = json_str ? json_str : "[]";
+        free(json_str);
+        cJSON_Delete(array);
+        return result;
+    }
+
+    ReturnValue PlayMp3(const std::string& name) {
+        if (!is_sdcard_found) {
+            return "SD卡未就绪。";
+        }
+
+        std::string file_path = std::string(SD_MOUNT_POINT) + "/" + name;
+        struct stat st;
+        
+        // 检查文件是否存在，如果不存在尝试加上 .mp3 后缀
+        if (stat(file_path.c_str(), &st) != 0) {
+            if (name.find(".mp3") == std::string::npos) {
+                file_path += ".mp3";
+                if (stat(file_path.c_str(), &st) != 0) {
+                    return "没有找到文件: " + name;
+                }
+            } else {
+                return "没有找到文件: " + name;
+            }
+        }
+
+        ESP_LOGI(TAG, "Playing MP3: %s", file_path.c_str());
+        FILE *fp = fopen(file_path.c_str(), "rb");
+        if (fp) {
+            audio_player_play(fp);
+            // 播放音乐后自动切换 ChatState（回到 Idle 状态以显示待机 UI 和音乐图标）
+            Application::GetInstance().SetDeviceState(kDeviceStateIdle);
+            if (display_) {
+                auto lcd = static_cast<CustomLcdDisplay*>(display_);
+                lcd->UpdateMusicStatus(true, false);
+                lcd->SetChatMessage("system", ("正在播放: " + name).c_str());
+            }
+            return "正在播放: " + name;
+        }
+        return "无法打开文件进行播放。";
+    }
+
+    ReturnValue ResumeMp3() {
+        audio_player_resume();
+        // 恢复播放后自动切换 ChatState（回到 Idle 状态）
+        Application::GetInstance().SetDeviceState(kDeviceStateIdle);
+        if (display_) {
+            static_cast<CustomLcdDisplay*>(display_)->UpdateMusicStatus(true, false);
+        }
+        return "继续播放。";
+    }
+
+    ReturnValue StopMp3() {
+        audio_player_stop();
+        if (display_) {
+            auto lcd = static_cast<CustomLcdDisplay*>(display_);
+            lcd->UpdateMusicStatus(false, false);
+            lcd->SetChatMessage("system", "");
+        }
+        return "已停止播放。";
     }
 
 public:
 
     ~CustomBoard() {
-        // Stop tasks
-
-        if (touch_task_handle_ != nullptr) {
-            vTaskDelete(touch_task_handle_);
-        }
+        audio_player_delete();
 
         // Delete objects
         delete cst816s_;
@@ -816,6 +1005,14 @@ public:
 
         InitializePowerManager();
         InitializePowerSaveTimer();
+
+        audio_player_config_t config = {
+            .mute_fn = audio_mute_callback,
+            .clk_set_fn = audio_reconfig_callback,
+            .write_fn = audio_write_callback,
+        };
+        audio_player_new(config);
+
         InitializeI2c();
         I2cDetect();
         InitializeTca9554();
@@ -823,7 +1020,8 @@ public:
         Initializest77916Display();
         InitializeCst816sTouchPad();
         InitializeButtons();
-        //InitializeSDcardSpi();
+        InitializeSDcardSpi();
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
     }
 
@@ -866,6 +1064,14 @@ public:
         if (discharging != last_discharging) {
             power_save_timer_->SetEnabled(discharging);
             last_discharging = discharging;
+        }
+
+        // 自动检测播放状态并更新图标（利用电池电量获取的周期性调用）
+        if (display_) {
+            audio_player_state_t audio_state = audio_player_get_state();
+            auto app_state = Application::GetInstance().GetDeviceState();
+            bool is_chatting = (app_state == kDeviceStateListening || app_state == kDeviceStateSpeaking);
+            static_cast<CustomLcdDisplay*>(display_)->UpdateMusicStatus(audio_state != AUDIO_PLAYER_STATE_IDLE, is_chatting || audio_state == AUDIO_PLAYER_STATE_PAUSE);
         }
 
         level = power_manager_->GetBatteryLevel();
