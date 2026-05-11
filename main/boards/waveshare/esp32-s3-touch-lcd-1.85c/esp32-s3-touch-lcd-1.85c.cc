@@ -22,6 +22,9 @@
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
 
+#include "esp_private/sdmmc_common.h"
+#include <esp_vfs_fat.h>
+#include <driver/sdspi_host.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -225,6 +228,89 @@ static const st77916_lcd_init_cmd_t vendor_specific_init_new[] = {
     {0x29, (uint8_t []){0x00}, 1, 0},  
 };
 
+class CustomLcdDisplay : public SpiLcdDisplay
+{
+public:
+    CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
+                     esp_lcd_panel_handle_t panel_handle,
+                     int width,
+                     int height,
+                     int offset_x,
+                     int offset_y,
+                     bool mirror_x,
+                     bool mirror_y,
+                     bool swap_xy)
+        : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy)
+    {
+        // Note: UI customization should be done in SetupUI(), not in constructor
+        // to ensure lvgl objects are created before accessing them
+    }
+
+    virtual void SetupUI() override {
+        // Call parent SetupUI() first to create all lvgl objects
+        SpiLcdDisplay::SetupUI();
+
+        DisplayLockGuard lock(this);
+
+        /*
+            auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+            auto text_font = lvgl_theme->text_font()->font();
+            auto icon_font = lvgl_theme->icon_font()->font();
+
+            lv_obj_set_size(top_bar_, LV_HOR_RES, text_font->line_height);
+            lv_obj_set_style_layout(top_bar_, LV_LAYOUT_NONE, 0);
+            lv_obj_set_style_pad_top(top_bar_, 10, 0);
+            lv_obj_set_style_pad_bottom(top_bar_, 1, 0);
+
+            lv_obj_set_size(status_bar_, LV_HOR_RES, text_font->line_height);
+            lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);
+            lv_obj_set_style_pad_top(status_bar_, 10, 0);
+            lv_obj_set_style_pad_bottom(status_bar_, 1, 0);
+            lv_obj_set_y(status_bar_, text_font->line_height);
+            lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+
+            // Reparent mute and battery labels to top_bar_ to allow absolute positioning
+            lv_obj_set_parent(mute_label_, top_bar_);
+            lv_obj_set_parent(battery_label_, top_bar_);
+            lv_obj_set_style_margin_left(battery_label_, 0, 0);
+
+            // 针对圆形屏幕调整位置
+            //      network  mute  battery     //
+            //               status            //
+            lv_obj_align(network_label_, LV_ALIGN_TOP_MID, -1.5 * icon_font->line_height, 0);
+            lv_obj_align(mute_label_, LV_ALIGN_TOP_MID, 1.0 * icon_font->line_height, 0);
+            lv_obj_align(battery_label_, LV_ALIGN_TOP_MID, 2.5 * icon_font->line_height, 0);
+            
+            lv_obj_align(status_label_, LV_ALIGN_BOTTOM_MID, 0, 0);
+            lv_obj_set_flex_grow(status_label_, 0);
+            lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
+            lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+            lv_obj_align(notification_label_, LV_ALIGN_BOTTOM_MID, 0, 0);
+            lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
+            lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+            lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -20);
+            lv_obj_set_style_bg_color(low_battery_popup_, lv_color_hex(0xFF0000), 0);
+            lv_obj_set_width(low_battery_label_, LV_HOR_RES * 0.75);
+            lv_label_set_long_mode(low_battery_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+            // 针对圆形屏幕调整底部对话框位置，避免被圆角遮挡
+            lv_obj_set_style_pad_bottom(bottom_bar_, 30, 0);
+            lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.75); // 限制宽度，避免文字贴边
+        */
+
+        // 状态栏容器适配
+        lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 0.12, 0);  // 左侧填充12%
+        lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 0.12, 0); // 右侧填充12%
+        // 表情容器上移适配
+        lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -30);          // 向上偏移30
+        // 消息栏适配
+        lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, -20);     // 向上偏移20
+    }
+};
+
+
 class Cst816s : public I2cDevice {
 public:
     struct TouchPoint_t {
@@ -355,6 +441,7 @@ private:
     Display* display_ = nullptr;
     Cst816s* cst816s_;
     esp_lcd_touch_handle_t tp;   // LCD touch handle
+    bool is_sdcard_found = false;
     TaskHandle_t touch_task_handle_ = nullptr;
     esp_timer_handle_t emotion_reset_timer_ = nullptr;
     PowerManager* power_manager_ = nullptr;
@@ -425,6 +512,28 @@ private:
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
     
+    void I2cDetect() {
+        uint8_t address;
+        printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\r\n");
+        for (int i = 0; i < 128; i += 16) {
+            printf("%02x: ", i);
+            for (int j = 0; j < 16; j++) {
+                fflush(stdout);
+                address = i + j;
+                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(200));
+                if (ret == ESP_OK) {
+                    printf("%02x ", address);
+                } else if (ret == ESP_ERR_TIMEOUT) {
+                    printf("UU ");
+                } else {
+                    printf("-- ");
+                }
+            }
+            printf("\r\n");
+        }
+    }
+
+
     void InitializeTca9554(void)
     {
         esp_err_t ret = esp_io_expander_new_i2c_tca9554(i2c_bus_, I2C_ADDRESS, &io_expander);
@@ -568,6 +677,7 @@ private:
             printf("Failed to read register 0x04, error code: %d\n", ret);
         } 
         // panel_io_spi_del(io_handle);
+        esp_lcd_panel_io_del(panel_io);
         io_config.pclk_hz = 80 * 1000 * 1000;
         if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)QSPI_LCD_HOST, &io_config, &panel_io) != ESP_OK) {
             printf("Failed to set LCD communication parameters -- SPI\r\n");
@@ -605,10 +715,56 @@ private:
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 #else
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        display_ = new CustomLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 #endif
     }
+
+    void InitializeSDcardSpi() {
+        spi_bus_config_t bus_cnf = {
+            .mosi_io_num = SD_CMD,
+            .miso_io_num = SD_DATA0,
+            .sclk_io_num = SD_CLK,
+            .quadwp_io_num = -1,
+            .quadhd_io_num = -1,
+            .max_transfer_sz = 400000,
+        };
+
+        esp_err_t err = spi_bus_initialize(SD_SPI_HOST, &bus_cnf, SPI_DMA_CH_AUTO);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "SPI总线初始化失败: %s", esp_err_to_name(err));
+            return;
+        }
+        
+        static sdspi_device_config_t slot_cnf = {
+            .host_id = SD_SPI_HOST,
+            .gpio_cs = SD_CS,
+            .gpio_cd = SDSPI_SLOT_NO_CD,
+            .gpio_wp = GPIO_NUM_NC,
+            .gpio_int = GPIO_NUM_NC,
+        };
+        
+        esp_vfs_fat_sdmmc_mount_config_t mount_cnf = {
+            .format_if_mount_failed = false,
+            .max_files = 5,
+            .allocation_unit_size = 16 * 1024,
+        };
+        
+        sdmmc_card_t* card = NULL;
+        
+        sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+        err = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &host, &slot_cnf, &mount_cnf, &card);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "SD卡挂载失败: %s", esp_err_to_name(err));
+            is_sdcard_found = false;
+            return;
+        } else if (err == ESP_OK) {
+            ESP_LOGI(TAG, "SD卡挂载成功");
+            is_sdcard_found = true;
+        }
+        // sdmmc_card_print_info(stdout, card); // 打印SD卡信息
+    }
+
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
@@ -661,11 +817,13 @@ public:
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeI2c();
+        I2cDetect();
         InitializeTca9554();
         InitializeSpi();
         Initializest77916Display();
         InitializeCst816sTouchPad();
         InitializeButtons();
+        //InitializeSDcardSpi();
         GetBacklight()->RestoreBrightness();
     }
 

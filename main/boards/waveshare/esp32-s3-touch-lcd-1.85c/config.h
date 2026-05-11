@@ -73,6 +73,15 @@
 #define TP_PIN_NUM_RST   (GPIO_NUM_NC)
 #define TP_PIN_NUM_INT   (GPIO_NUM_4)
 
+#define SD_DATA0    GPIO_NUM_16
+#define SD_CLK      GPIO_NUM_14
+#define SD_CMD      GPIO_NUM_17
+#define SD_CS       GPIO_NUM_NC    //EXT IO 2
+#define SD_MOUNT_POINT "/sdcard"
+#define SD_SPI_HOST SPI2_HOST
+
+
+
 #define BATTERY_EN_PIN          GPIO_NUM_NC
 #define BATTERY_ADC_PIN         GPIO_NUM_8
 #define BATTERY_CHARGING_PIN    GPIO_NUM_NC
