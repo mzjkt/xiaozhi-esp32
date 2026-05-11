@@ -78,7 +78,7 @@
 #define SD_CMD      GPIO_NUM_17
 #define SD_CS       GPIO_NUM_NC    //EXT IO 2
 #define SD_MOUNT_POINT "/sdcard"
-#define SD_SPI_HOST SPI2_HOST
+#define SD_SPI_HOST SPI3_HOST
 
 
 

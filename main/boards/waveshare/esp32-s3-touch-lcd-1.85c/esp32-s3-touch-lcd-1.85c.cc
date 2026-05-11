@@ -255,10 +255,12 @@ public:
     }
 
     virtual void SetupUI() override {
-        // Call parent SetupUI() first to create all lvgl objects
+        // Call parent SetupUI() first to create all base LVGL objects.
+        // It handles its own locking, so do not lock before this call.
         SpiLcdDisplay::SetupUI();
 
         DisplayLockGuard lock(this);
+        lv_display_set_default(display_);
 
         /*
             auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
@@ -309,19 +311,26 @@ public:
         */
 
         // 状态栏容器适配
-        lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 0.12, 0);  // 左侧填充12%
-        lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 0.12, 0); // 右侧填充12%
+        if (top_bar_ != nullptr) {
+            lv_obj_set_style_pad_left(top_bar_, LV_HOR_RES * 0.33, 0);  // 左侧填充12%
+            lv_obj_set_style_pad_right(top_bar_, LV_HOR_RES * 0.33, 0); // 右侧填充12%
+        }
 
         // 创建播放状态图标
         music_label_ = lv_label_create(top_bar_);
         lv_label_set_text(music_label_, "");
         lv_obj_add_flag(music_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_align(music_label_, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_align(music_label_, LV_ALIGN_CENTER, -40, 0);
 
         // 表情容器上移适配
-        lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -30);          // 向上偏移30
+        if (emoji_box_ != nullptr) {
+            lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -10);          // 向上偏移30
+        }
+
         // 消息栏适配
-        lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, -20);     // 向上偏移20
+        if (bottom_bar_ != nullptr) {
+            lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 60);     // 向上偏移20
+        }
     }
 
     void UpdateMusicStatus(bool playing, bool paused) {
@@ -477,12 +486,12 @@ private:
     esp_timer_handle_t emotion_reset_timer_ = nullptr;
     PowerManager* power_manager_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
+    static CustomBoard* instance_;
 
     // 静态成员函数，用于控制 SD 卡片选
     static esp_err_t sd_cs_set_level(int level) {
-        CustomBoard* board = static_cast<CustomBoard*>(&Board::GetInstance());
-        if (board && board->io_expander) {
-            return esp_io_expander_set_level(board->io_expander, IO_EXPANDER_PIN_NUM_2, level);
+        if (instance_ && instance_->io_expander) {
+            return esp_io_expander_set_level(instance_->io_expander, IO_EXPANDER_PIN_NUM_2, level);
         }
         return ESP_FAIL;
     }
@@ -508,6 +517,9 @@ private:
     static esp_err_t audio_write_callback(void *audio_buffer, size_t size, size_t *bytes_written, uint32_t timeout_ms) {
         auto codec = Board::GetInstance().GetAudioCodec();
         if (codec) {
+            // 避免在循环中创建 std::vector，这会导致频繁的堆内存分配导致卡顿
+            // 直接调用 codec 的原始输出方法（如果 AudioCodec 支持指针接口）
+            // 如果项目中的 AudioCodec 只接受 vector，请确保该 vector 是预先分配好的
             std::vector<int16_t> data((int16_t*)audio_buffer, (int16_t*)audio_buffer + size / 2);
             codec->OutputData(data);
             *bytes_written = size;
@@ -589,7 +601,8 @@ private:
             for (int j = 0; j < 16; j++) {
                 fflush(stdout);
                 address = i + j;
-                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(200));
+                // 缩短超时时间，避免扫描太慢
+                esp_err_t ret = i2c_master_probe(i2c_bus_, address, pdMS_TO_TICKS(100));
                 if (ret == ESP_OK) {
                     printf("%02x ", address);
                 } else if (ret == ESP_ERR_TIMEOUT) {
@@ -600,6 +613,7 @@ private:
             }
             printf("\r\n");
         }
+        ESP_LOGI(TAG, "I2C scan finished");
     }
 
 
@@ -748,7 +762,8 @@ private:
         } 
         // panel_io_spi_del(io_handle);
         esp_lcd_panel_io_del(panel_io);
-        io_config.pclk_hz = 80 * 1000 * 1000;
+        // 降低 SPI 频率以提高稳定性
+        io_config.pclk_hz = 40 * 1000 * 1000;
         if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)QSPI_LCD_HOST, &io_config, &panel_io) != ESP_OK) {
             printf("Failed to set LCD communication parameters -- SPI\r\n");
             return ;
@@ -824,6 +839,7 @@ private:
 
         // 分配自定义的 CS 控制函数
         sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+        host.slot = SD_SPI_HOST; // 必须指定为 SPI3_HOST，否则默认为 SPI2 会与 LCD 冲突
         // 挂钩 do_transaction 以便在每次操作时自动切换 CS 引脚
         orig_sd_do_transaction = host.do_transaction;
         host.do_transaction = sd_do_transaction;
@@ -838,6 +854,7 @@ private:
             is_sdcard_found = true;
         }
         // sdmmc_card_print_info(stdout, card); // 打印SD卡信息
+        ESP_LOGI(TAG, "SD card initialization finished");
     }
 
 
@@ -901,8 +918,15 @@ private:
         cJSON* array = cJSON_CreateArray();
         struct dirent* entry;
         while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_type == DT_REG && strstr(entry->d_name, ".mp3")) {
-                cJSON_AddItemToArray(array, cJSON_CreateString(entry->d_name));
+            if (entry->d_type == DT_REG) {
+                size_t len = strlen(entry->d_name);
+                if (len >= 4) {
+                    const char* ext = entry->d_name + len - 4;
+                    // 不区分大小写检查后缀是否为 .mp3
+                    if (strcasecmp(ext, ".mp3") == 0) {
+                        cJSON_AddItemToArray(array, cJSON_CreateString(entry->d_name));
+                    }
+                }
             }
         }
         closedir(dir);
@@ -937,9 +961,11 @@ private:
         ESP_LOGI(TAG, "Playing MP3: %s", file_path.c_str());
         FILE *fp = fopen(file_path.c_str(), "rb");
         if (fp) {
-            audio_player_play(fp);
-            // 播放音乐后自动切换 ChatState（回到 Idle 状态以显示待机 UI 和音乐图标）
-            Application::GetInstance().SetDeviceState(kDeviceStateIdle);
+            audio_player_play(fp); // 先启动播放器，确保状态变为 PLAYING
+
+            auto& app = Application::GetInstance();
+            app.SetDeviceState(kDeviceStateIdle); // 这里内部会自动根据播放状态关闭唤醒词
+
             if (display_) {
                 auto lcd = static_cast<CustomLcdDisplay*>(display_);
                 lcd->UpdateMusicStatus(true, false);
@@ -962,6 +988,14 @@ private:
 
     ReturnValue StopMp3() {
         audio_player_stop();
+        // 停止音乐后，重新开启唤醒词检测
+        auto& app = Application::GetInstance();
+        app.GetAudioService().EnableWakeWordDetection(true);
+        // 如果在播放期间强制进入了 Idle，这里确保状态一致
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            app.GetAudioService().EnableVoiceProcessing(false);
+        }
+
         if (display_) {
             auto lcd = static_cast<CustomLcdDisplay*>(display_);
             lcd->UpdateMusicStatus(false, false);
@@ -991,8 +1025,8 @@ public:
         }
     }
 
-    CustomBoard() :
-        boot_button_(BOOT_BUTTON_GPIO) {
+    CustomBoard() : boot_button_(BOOT_BUTTON_GPIO) {
+        instance_ = this; // 尽早初始化 instance 指针以供回调函数使用
 
         const esp_timer_create_args_t emotion_timer_args = {
             .callback = &CustomBoard::emotion_reset_timer_callback,
@@ -1016,12 +1050,16 @@ public:
         InitializeI2c();
         I2cDetect();
         InitializeTca9554();
+        ESP_LOGI(TAG, "Initializing SPI and Display...");
         InitializeSpi();
         Initializest77916Display();
+        ESP_LOGI(TAG, "Initializing Touch and Buttons...");
         InitializeCst816sTouchPad();
         InitializeButtons();
+        ESP_LOGI(TAG, "Initializing SD Card and Tools...");
         InitializeSDcardSpi();
         InitializeTools();
+        ESP_LOGI(TAG, "Board initialization complete");
         GetBacklight()->RestoreBrightness();
     }
 
@@ -1069,6 +1107,12 @@ public:
         // 自动检测播放状态并更新图标（利用电池电量获取的周期性调用）
         if (display_) {
             audio_player_state_t audio_state = audio_player_get_state();
+            // 状态看门狗：如果正在播放音乐，持续确保唤醒词处于关闭状态
+            if (audio_state == AUDIO_PLAYER_STATE_PLAYING) {
+                Application::GetInstance().GetAudioService().EnableWakeWordDetection(false);
+                Application::GetInstance().GetAudioService().EnableVoiceProcessing(false);
+            }
+            
             auto app_state = Application::GetInstance().GetDeviceState();
             bool is_chatting = (app_state == kDeviceStateListening || app_state == kDeviceStateSpeaking);
             static_cast<CustomLcdDisplay*>(display_)->UpdateMusicStatus(audio_state != AUDIO_PLAYER_STATE_IDLE, is_chatting || audio_state == AUDIO_PLAYER_STATE_PAUSE);
@@ -1087,3 +1131,5 @@ public:
 };
 
 DECLARE_BOARD(CustomBoard);
+
+CustomBoard* CustomBoard::instance_ = nullptr;

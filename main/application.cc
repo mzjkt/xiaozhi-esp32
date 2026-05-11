@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "audio_player.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -497,7 +498,10 @@ void Application::InitializeProtocol() {
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            // 如果音乐正在播放，忽略来自服务器的 TTS 语音包，防止混音卡顿
+            if (audio_player_get_state() == AUDIO_PLAYER_STATE_IDLE) {
+                audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            }
         }
     });
     
@@ -531,7 +535,8 @@ void Application::InitializeProtocol() {
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        // 如果正在播放音乐，TTS 结束后必须回到 Idle，不能进入 Listening 开启麦克风
+                        if (listening_mode_ == kListeningModeManualStop || audio_player_get_state() != AUDIO_PLAYER_STATE_IDLE) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -862,10 +867,13 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();  // Clear messages first
+            // 只有在没有播放音乐时才清除聊天记录，否则会把“正在播放”提示删掉
+            if (audio_player_get_state() == AUDIO_PLAYER_STATE_IDLE) {
+                display->ClearChatMessages();
+            }
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            audio_service_.EnableWakeWordDetection(audio_player_get_state() == AUDIO_PLAYER_STATE_IDLE);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1113,4 +1121,3 @@ void Application::ResetProtocol() {
         protocol_.reset();
     });
 }
-

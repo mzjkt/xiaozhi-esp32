@@ -215,13 +215,33 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     ESP_LOGI(TAG, "Simplex channels created");
 }
 
+void NoAudioCodecSimplex::SetSampleRate(int rate) {
+    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    i2s_channel_disable(tx_handle_); // 必须先停止通道才能重配置时钟
+    i2s_std_clk_config_t clk_cfg = {
+        .sample_rate_hz = (uint32_t)rate,
+        .clk_src = I2S_CLK_SRC_DEFAULT,
+        .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+#ifdef I2S_HW_VERSION_2
+        .ext_clk_freq_hz = 0,
+#endif
+    };
+    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(tx_handle_, &clk_cfg));
+    i2s_channel_enable(tx_handle_);
+    output_sample_rate_ = rate; // 更新内部状态
+    ESP_LOGI(TAG, "NoAudioCodecSimplex output sample rate reconfigured to %d Hz", rate);
+}
+
 int NoAudioCodec::Write(const int16_t* data, int samples) {
     std::lock_guard<std::mutex> lock(data_if_mutex_);
-    std::vector<int32_t> buffer(samples);
+    static std::vector<int32_t> buffer;
+    if (buffer.size() < (size_t)samples) {
+        buffer.resize(samples);
+    }
 
     // output_volume_: 0-100
     // volume_factor_: 0-65536
-    int32_t volume_factor = pow(double(output_volume_) / 100.0, 2) * 65536;
+    int32_t volume_factor = (output_volume_ * output_volume_ * 65536) / 10000;
     for (int i = 0; i < samples; i++) {
         int64_t temp = int64_t(data[i]) * volume_factor; // 使用 int64_t 进行乘法运算
         if (temp > INT32_MAX) {
